@@ -1,0 +1,4 @@
+history.json
+results/
+.venv/
+__pycache__/

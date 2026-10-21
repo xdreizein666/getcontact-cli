@@ -45,6 +45,7 @@ DH_G = 7
 
 CONFIG_DIR = Path(os.environ.get("GTC_CONFIG_DIR", Path.home() / ".config" / "gtc"))
 CRED_FILE = CONFIG_DIR / "credentials.json"
+HISTORY_FILE = Path(__file__).resolve().parent / "history.json"
 RESULTS_DIR = Path(os.environ.get("GTC_RESULTS_DIR", Path(__file__).resolve().parent / "results"))
 
 
@@ -196,7 +197,21 @@ def normalize_phone(raw: str) -> str:
 
 
 #  features
-def api_search(cred: dict, phone: str, source: str) -> dict:
+def history_entry(v: dict) -> tuple[str, dict]:
+    # entri lama (sebelum ada waktu) = body mentah
+    return (v["time"], v["body"]) if "time" in v and "body" in v else ("-", v)
+
+
+def api_search(cred: dict, phone: str, source: str, refresh: bool = False) -> dict:
+    # ponytail: whole-file JSON cache, switch to sqlite if history gets large
+    key = f"{source}:{phone}"
+    try:
+        history = json.loads(HISTORY_FILE.read_text("utf-8"))
+    except (OSError, ValueError):
+        history = {}
+    if not refresh and key in history:
+        print(f"(dari history, pakai --refresh untuk cari ulang)", file=sys.stderr)
+        return history_entry(history[key])[1]
     endpoint = "/v2.8/number-detail" if source == "tags" else "/v2.8/search"
     payload = {
         "countryCode": COUNTRY,
@@ -209,6 +224,9 @@ def api_search(cred: dict, phone: str, source: str) -> dict:
     meta = dig(body, "meta.httpStatusCode")
     if code != 200 or meta != 200:
         raise GtcError(f"HTTP {code}/{meta}: {dig(body, 'meta.errorMessage', 'unknown error')}")
+    history[key] = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "body": body}
+    HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False), "utf-8")
+    os.chmod(HISTORY_FILE, 0o600)
     return body
 
 
@@ -241,7 +259,7 @@ def cmd_search(args) -> int:
     store = load_store()
     name, cred = get_cred(store, args.account)
     phone = normalize_phone(args.phone)
-    body = api_search(cred, phone, args.type)
+    body = api_search(cred, phone, args.type, args.refresh)
     if args.json:
         print(json.dumps(body, indent=2, ensure_ascii=False))
         return 0
@@ -256,7 +274,7 @@ def cmd_search(args) -> int:
         for t in tags:
             print(f"    - {t.get('tag')}  x{t.get('count', '')}")
     if not profile and not tags:
-        print(json.dumps(body, indent=2, ensure_ascii=False))
+        print("  Tidak ada data (belum ada yang menyimpan nomor ini). Detail lengkap: --json")
     return 0
 
 
@@ -281,7 +299,7 @@ def cmd_batch(args) -> int:
         raw = row[col].strip()
         try:
             phone = normalize_phone(raw)
-            body = api_search(cred, phone, args.type)
+            body = api_search(cred, phone, args.type, args.refresh)
             prof = dig(body, "result.profile") or {}
             tags = [t.get("tag", "") for t in (dig(body, "result.tags") or [])]
             out.writerow([phone, "ok", prof.get("displayName", ""),
@@ -291,6 +309,24 @@ def cmd_batch(args) -> int:
             out.writerow([raw, "error", "", "", "", str(e)])
             print(f"FAIL {raw}: {e}", file=sys.stderr)
         time.sleep(args.delay)
+    return 0
+
+
+def cmd_history(args) -> int:
+    try:
+        history = json.loads(HISTORY_FILE.read_text("utf-8"))
+    except (OSError, ValueError):
+        history = {}
+    if not history:
+        print("History kosong.")
+        return 0
+    for key, v in history.items():
+        kind, phone = key.split(":", 1)
+        when, body = history_entry(v)
+        prof = dig(body, "result.profile") or {}
+        n = len(dig(body, "result.tags") or []) or prof.get("tagCount", "-")
+        print(f"{when:<19} {kind:<8} {phone:<16} {prof.get('displayName') or '-':<28} tags: {n}")
+    print(f"\n{len(history)} entri. Detail: gtc search <nomor> [-t tags]")
     return 0
 
 
@@ -526,6 +562,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("phone")
     s.add_argument("-t", "--type", choices=["profile", "tags"], default="profile")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--refresh", action="store_true", help="skip history, query again")
     s.set_defaults(func=cmd_search)
 
     b = sub.add_parser("batch", help="look up every number in a CSV")
@@ -533,7 +570,11 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("-t", "--type", choices=["profile", "tags"], default="tags")
     b.add_argument("-o", "--out", default="-", help="output CSV path (default stdout)")
     b.add_argument("--delay", type=float, default=1.5, help="seconds between requests")
+    b.add_argument("--refresh", action="store_true", help="skip history, query again")
     b.set_defaults(func=cmd_batch)
+
+    h = sub.add_parser("history", help="list previous lookups")
+    h.set_defaults(func=cmd_history)
 
     q = sub.add_parser("quota", help="show subscription usage")
     q.add_argument("--json", action="store_true")
@@ -625,6 +666,7 @@ MENU = [
     ("Sisa kuota akun", "quota"),
     ("Cari banyak nomor dari file CSV", "batch"),
     ("Buka blokir / captcha", "captcha"),
+    ("Lihat history pencarian", "history"),
     ("Lihat akun tersimpan", "credlist"),
     ("Tambah akun baru (butuh WhatsApp)", "generate"),
 ]
@@ -671,6 +713,8 @@ def interactive() -> int:
                 sys.argv = ["gtc", "batch", csv_path]
             elif action == "captcha":
                 sys.argv = ["gtc", "captcha"]
+            elif action == "history":
+                sys.argv = ["gtc", "history"]
             elif action == "credlist":
                 sys.argv = ["gtc", "cred", "list"]
             elif action == "generate":
